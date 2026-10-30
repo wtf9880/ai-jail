@@ -2,3 +2,8 @@
 /result
 /.ai-jail
 /.codex
+# local repro probe artifacts
+/screen_before*.txt
+/screen_after*.txt
+/screen_plain_after.txt
+/trace.log

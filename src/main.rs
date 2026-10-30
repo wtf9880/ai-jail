@@ -1392,6 +1392,122 @@ mod tests {
         }));
     }
 
+    fn run_echo_through_pty(status_bar: bool) -> Option<(i32, String)> {
+        // Drives the REAL pty::run_with_config with a plain `echo hi`
+        // child (no sandbox), then queries the host terminal's cursor
+        // position. Returns None when stdout isn't a real TTY.
+        if !std::io::stdout().is_terminal() {
+            return None;
+        }
+        use std::io::{Read, Write};
+        use std::io::IsTerminal;
+        let config = Config::default();
+        let pty = crate::pty::open().expect("openpty");
+        let mut cmd = std::process::Command::new("echo");
+        cmd.arg("hi");
+        let key = crate::pty::parse_resize_redraw_key("disabled").unwrap();
+        let rc = crate::pty::run_with_config(
+            pty,
+            &mut cmd,
+            key.as_deref(),
+            &config,
+            status_bar,
+        )
+        .ok();
+        // Re-enter raw mode briefly to read the cursor-position reply.
+        let stdin = std::io::stdin();
+        let saved = nix::sys::termios::tcgetattr(&stdin).ok();
+        if let Some(ref s) = saved {
+            let mut raw = s.clone();
+            nix::sys::termios::cfmakeraw(&mut raw);
+            let _ = nix::sys::termios::tcsetattr(
+                &stdin,
+                nix::sys::termios::SetArg::TCSANOW,
+                &raw,
+            );
+        }
+        let _ = std::io::stdout().write_all(b"\x1b[6n");
+        let _ = std::io::stdout().flush();
+        let mut buf = [0u8; 64];
+        let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+        let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if let Some(ref s) = saved {
+            let _ = nix::sys::termios::tcsetattr(
+                &stdin,
+                nix::sys::termios::SetArg::TCSANOW,
+                s,
+            );
+        }
+        Some((rc.unwrap_or(-1), reply))
+    }
+
+    /// Cursor-position reply looks like `ESC [ row ; col R`; home is
+    /// row == 1 && col == 1. Exact parse avoids false positives on rows
+    /// like 11;1R (where the substring "1;1R" would match).
+    fn cursor_at_home(reply: &str) -> bool {
+        let t = reply.trim();
+        if !t.starts_with("\x1b[") || !t.ends_with('R') {
+            return false;
+        }
+        let inner = &t["\x1b[".len()..t.len() - 1];
+        let mut parts = inner.split(';');
+        let row = parts.next().and_then(|s| s.parse::<u16>().ok());
+        let col = parts.next().and_then(|s| s.parse::<u16>().ok());
+        row == Some(1) && col == Some(1)
+    }
+
+    #[test]
+    fn repro_cursor_after_echo_no_status_bar() {
+        // Status bar OFF: mimics a multiplexer (auto-skip) or
+        // --no-status-bar. The exit sequence must NOT yank the cursor to
+        // the home position (a bare `ESC [ r` used to — the exact reason
+        // `--terminal-passthrough` never helped). TTY-gated: run with
+        // `--nocapture` on an interactive terminal; no-ops in CI.
+        if let Some((rc, reply)) = run_echo_through_pty(false) {
+            eprintln!("[nobar] rc={rc} cursor_reply={reply:?}");
+            assert!(
+                !cursor_at_home(&reply),
+                "cursor landed at home (top-left) after exit: {reply:?}"
+            );
+        }
+    }
+
+    /// Manual reproduction harness for the tmux-zoom residual (Issue 2).
+    ///
+    /// Drives the REAL PTY proxy with a plain `bash -i` child (no bwrap),
+    /// mirroring `ai-jail bash` exactly for the resize / SIGWINCH /
+    /// handle_sigwinch path. `install_handlers` is called explicitly
+    /// (the normal `#[test]` harness via `cargo test` does NOT install
+    /// them — only `main()` does), so SIGWINCH delivery works on zoom.
+    ///
+    /// TTY-gated + `#[ignore]`: run the *test binary* directly inside a
+    /// 12-row tmux pane, then `resize-pane -Z` to zoom, and `capture-pane`
+    /// to see the real-terminal result. No CI equivalent exists for this
+    /// (it needs a real tty + tmux).
+    #[test]
+    #[ignore]
+    fn repro_bash_zoom_via_pty_proxy() {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            return;
+        }
+        crate::signals::install_handlers();
+        let config = Config::default();
+        let pty = crate::pty::open().expect("openpty");
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-i");
+        let rc = crate::pty::run_with_config(
+            pty,
+            &mut cmd,
+            None, // resize_redraw_key: None for bash (matches ai-jail bash,
+                  // which only sets a key for "codex").
+            &config,
+            false, // status_bar OFF (tmux auto-skip path).
+        )
+        .ok();
+        eprintln!("[repro-zoom] rc={rc:?}");
+    }
+
     #[test]
     fn default_agent_api_egress_follows_the_api_host_table() {
         // A bare launch of a known API agent with a canonical host applies,
