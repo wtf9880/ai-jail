@@ -163,8 +163,16 @@ const TERMINAL_RESET_SEQ: &str = concat!(
     "\x1b[?25h",
     // Reset SGR (colors/attrs).
     "\x1b[0m",
-    // Reset scroll region.
-    "\x1b[r",
+    // Reset the scroll region. DECSTBM (`CSI r`) always relocates the
+    // cursor to the home position (top-left), so a bare reset yanks the
+    // host cursor to the top after *every* sandboxed command exits —
+    // this is why `--terminal-passthrough` could not help: the reset is
+    // emitted unconditionally at the end of the PTY loop. Wrap it in a
+    // DECSC/DECRC save-restore so the region resets to the full screen
+    // *without* moving the cursor. The save slot is safe to clobber
+    // here: this only runs after the child has exited, so no in-flight
+    // TUI owns it (issue #40 follow-up).
+    "\x1b[s\x1b[r\x1b[u",
 );
 
 /// Write the terminal reset sequence to stdout. No-op when stdout
@@ -231,5 +239,39 @@ mod tests {
     fn terminal_reset_seq_restores_cursor_visibility_and_sgr() {
         assert!(TERMINAL_RESET_SEQ.contains("\x1b[?25h"));
         assert!(TERMINAL_RESET_SEQ.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn terminal_reset_seq_is_cursor_neutral() {
+        // DECSTBM (`ESC [ r`) relocates the cursor to the home position
+        // (top-left), which snapped the host cursor to the top after every
+        // sandboxed command exited — and `--terminal-passthrough` could not
+        // fix it because `terminal_reset` runs unconditionally. The reset
+        // must wrap the DECSTBM in a DECSC/DECRC save-restore
+        // (`ESC [ s` ... `ESC [ r` ... `ESC [ u`) so the scroll region is
+        // reset to the full screen *without* moving the cursor.
+        let save = TERMINAL_RESET_SEQ.find("\x1b[s");
+        let reset = TERMINAL_RESET_SEQ.find("\x1b[r");
+        let restore = TERMINAL_RESET_SEQ.find("\x1b[u");
+        assert!(
+            save.is_some(),
+            "reset sequence must save the cursor with ESC [ s"
+        );
+        assert!(
+            reset.is_some(),
+            "reset sequence must reset the scroll region with ESC [ r"
+        );
+        assert!(
+            restore.is_some(),
+            "reset sequence must restore the cursor with ESC [ u"
+        );
+        assert!(
+            save.unwrap() < reset.unwrap() && reset.unwrap() < restore.unwrap(),
+            "cursor save/restore must bracket the scroll-region reset: \
+             save={save:?} reset={reset:?} restore={restore:?}",
+            save = save,
+            reset = reset,
+            restore = restore,
+        );
     }
 }

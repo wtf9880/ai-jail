@@ -148,6 +148,20 @@ fn set_scroll_region(fd: i32, content_rows: u16) {
     write_all_raw(fd, seq.as_bytes());
 }
 
+/// Reset the scroll region to the full screen *without* relocating the
+/// cursor.
+///
+/// `DECSTBM` (`CSI r`) always moves the cursor to the home position
+/// (top-left), so a bare `ESC [ r` yanks the host cursor to the top
+/// after the child exits — the exact symptom `--terminal-passthrough`
+/// could never fix, because the reset is unconditional. Wrapping it in a
+/// `DECSC`/`DECRC` save-restore makes it cursor-neutral. The save slot is
+/// safe to clobber: this only runs once the child has exited, so no
+/// in-flight TUI owns it (issue #40 follow-up).
+fn reset_scroll_region(fd: i32) {
+    write_all_raw(fd, b"\x1b[s\x1b[r\x1b[u");
+}
+
 pub fn parse_resize_redraw_key(spec: &str) -> Result<Option<Vec<u8>>, String> {
     let normalized = spec
         .trim()
@@ -465,7 +479,10 @@ impl<'a> IoLoop<'a> {
         let screen = self.parser.screen();
         let diff = screen.state_diff(&self.prev_screen);
         write_all_raw(self.stdout, &diff);
-        write_all_raw(self.stdout, b"\x1b[r");
+        // Reset the scroll region (undo the status-bar region, or any
+        // custom region the child left behind) without snapping the
+        // cursor home — see [`reset_scroll_region`].
+        reset_scroll_region(self.stdout);
         if self.status_bar {
             crate::statusbar::redraw();
         }
