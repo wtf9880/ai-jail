@@ -24,18 +24,65 @@
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{self, SetArg, Termios};
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Stored master raw FD for async-signal-safe resize from SIGWINCH.
 static MASTER_FD: AtomicI32 = AtomicI32::new(-1);
 /// Whether the current proxy reserves a row for the status bar.
 static STATUS_BAR_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// `st_rdev` of the PTY *slave* (e.g. `/dev/pts/N`). The master fd is
+/// `/dev/ptmx` (major 5), whose device number differs from the slave's, so
+/// the `/proc`-based SIGWINCH fallback must match descendants' `tty_nr`
+/// against THIS, not against `fstat(MASTER_FD).st_rdev`. Zero when unset
+/// (unit tests that don't go through `run_with_passthrough`).
+static SLAVE_DEV: AtomicI64 = AtomicI64::new(0);
+
+/// Record the slave PTY device number for the SIGWINCH /proc fallback.
+pub fn set_slave_dev(slave_fd: i32) {
+    let mut st: nix::libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { nix::libc::fstat(slave_fd, &mut st) } == 0 {
+        SLAVE_DEV.store(st.st_rdev as i64, Ordering::SeqCst);
+    }
+}
 
 /// Set by signal handler; IO loop clears screen + redraws status bar
 /// BEFORE forwarding SIGWINCH to the child, preventing ghost bars.
 static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const RESIZE_REDRAW_DELAY: Duration = Duration::from_millis(75);
+
+/// Post-resize byte-capture budget (env-gated SIGWINCH trace). When the
+/// trace is enabled, `handle_sigwinch` sets this to a small budget so the
+/// next `handle_master_read`s log the child's bytes — i.e. whether the
+/// child actually repainted after the resize (SIGWINCH was delivered).
+static RESIZE_CHILD_BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+/// `AI_JAIL_TRACE_SIGWINCH` diagnostic: `1` for stderr, else a file path.
+/// Traces `handle_sigwinch` / `resize_pty` / `forward_sigwinch` plus the
+/// child's first bytes after a resize. Always no-op unless the env var is
+/// set, so it never changes normal behavior.
+fn sigwinch_trace_enabled() -> bool {
+    std::env::var_os("AI_JAIL_TRACE_SIGWINCH").is_some()
+}
+
+fn trace_sigwinch(msg: &str) {
+    let Some(path) = std::env::var_os("AI_JAIL_TRACE_SIGWINCH") else {
+        return;
+    };
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!("{ts} {msg}\n");
+    if path.to_str().map(|s| s == "1").unwrap_or(false) {
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    } else if let Ok(mut f) =
+        std::fs::OpenOptions::new().append(true).create(true).open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 /// Mark a SIGWINCH as pending. Called from the signal handler.
 pub fn set_sigwinch_pending() {
@@ -74,26 +121,220 @@ pub fn resize_pty() {
         }
         ws.ws_row -= 1;
     }
+    let rows = ws.ws_row;
     unsafe {
         nix::libc::ioctl(master, nix::libc::TIOCSWINSZ, &ws);
+    }
+    trace_sigwinch(&format!(
+        "resize_pty: read host rows={} cols={} status_bar={} -> slave rows={}",
+        rows + if STATUS_BAR_ACTIVE.load(Ordering::SeqCst) { 1 } else { 0 },
+        ws.ws_col,
+        STATUS_BAR_ACTIVE.load(Ordering::SeqCst),
+        rows
+    ));
+}
+
+/// Return host-namespace process-group ids of the PTY's foreground
+/// processes, resolving across `bwrap --unshare-pid`.
+///
+/// `TIOCGPGRP` on the master yields a *child-namespace* pgid, which is
+/// unaddressable from the parent (`kill(-pgid)` -> `ESRCH`). Walk the
+/// spawned sandbox process's host-namespace descendants and collect the
+/// `tpgid` (field 8 of `/proc/<pid>/stat` — the foreground pgrp *as seen
+/// from the host namespace*, which `kill(2)` can target despite the nested
+/// PID namespace) of every descendant whose controlling terminal is this PTY.
+///
+/// We prefer the descendant whose `tty_nr` (field 7) equals the master
+/// PTY device (`fstat(MASTER_FD).st_rdev`). If that precise match fails
+/// (e.g. device-encoding quirks or a helper sharing the tty), we fall back
+/// to signalling *every* tty-holding descendant, so the real shell (the
+/// actual foreground tty holder) still receives SIGWINCH.
+fn child_host_namespace_pgrps() -> Vec<nix::libc::pid_t> {
+    let child = crate::signals::child_pid();
+    if child <= 0 {
+        trace_sigwinch(&format!(
+            "child_host_namespace_pgrps: no child pid (child={child})"
+        ));
+        return Vec::new();
+    }
+    let master = MASTER_FD.load(Ordering::SeqCst);
+    if master < 0 {
+        return Vec::new();
+    }
+    // Prefer the recorded slave device (the child's controlling tty device),
+    // which is what `/proc/<pid>/stat` tty_nr reports. Master (`/dev/ptmx`)
+    // has a different st_rdev, so never match against it.
+    let dev = SLAVE_DEV.load(Ordering::SeqCst);
+    let mut st: nix::libc::stat = unsafe { std::mem::zeroed() };
+    let master_dev: Option<i64> = if dev != 0 {
+        None
+    } else if unsafe { nix::libc::fstat(master, &mut st) } == 0 {
+        Some(st.st_rdev as i64)
+    } else {
+        None
+    };
+    let dev = if dev != 0 { dev } else { master_dev.unwrap_or(0) };
+    if dev == 0 {
+        return Vec::new();
+    }
+    let our_pid = unsafe { nix::libc::getpid() };
+    trace_sigwinch(&format!(
+        "child_host_namespace_pgrps: child={child} slave_dev={dev:#x} master_dev={master_dev:?} our_pid={our_pid}"
+    ));
+
+    // Read /proc/<pid>/stat for a single pid; return (tpgid, precise) where
+    // `precise` is true iff its controlling-tty device (tty_nr, field 7)
+    // matches the master PTY device. `tpgid` (field 8) is the foreground
+    // pgrp *as seen from the host namespace* — killable from here even when
+    // the child sits in a nested PID namespace.
+    let inspect = |pid: nix::libc::pid_t,
+                   label: &str,
+                   depth: usize|
+     -> Option<(nix::libc::pid_t, bool)> {
+        let s = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(e) => {
+                trace_sigwinch(&format!(
+                    "  depth={depth} {label} pid={pid} stat_read_fail err={e}"
+                ));
+                return None;
+            }
+        };
+        // /proc/<pid>/stat => "pid (comm) state ppp cgg sess tty tpgid ..."
+        let rparen = s.rfind(')')?;
+        let mut it = s[rparen + 2..].split_whitespace();
+        let _state = it.next();
+        let _ppid = it.next();
+        let _pgrp = it.next();
+        let _session = it.next();
+        let tty_nr_s = it.next(); // field 7
+        let tpgid_s = it.next(); // field 8
+        let tty_nr_val = tty_nr_s.and_then(|v| v.parse::<i64>().ok());
+        let tty_match = tty_nr_val.is_some_and(|v| v == dev);
+        let tty_nonzero = tty_nr_val.is_some_and(|v| v != 0);
+        trace_sigwinch(&format!(
+            "  depth={depth} {label} pid={pid} tty_nr={tty_nr_s:?} (dev_match={tty_match} tty_nonzero={tty_nonzero}) tpgid={tpgid_s:?}"
+        ));
+        let tpg = tpgid_s.and_then(|v| v.parse::<nix::libc::pid_t>().ok())?;
+        if tpg <= 0 {
+            return None;
+        }
+        Some((tpg, tty_match))
+    };
+
+    let mut frontier: Vec<nix::libc::pid_t> = vec![child];
+    let mut precise: Option<nix::libc::pid_t> = None;
+    let mut tty_holders: Vec<nix::libc::pid_t> = Vec::new();
+    for depth in 0..4 {
+        let mut next: Vec<nix::libc::pid_t> = Vec::new();
+        for pid in frontier {
+            // (1) inspect this pid itself first — covers the recorded child
+            //    *being* the tty holder (no-bwrap exec case, or bwrap without
+            //    --new-session where the wrapper keeps the ctty).
+            if let Some((tpg, is_precise)) = inspect(pid, "self", depth) {
+                if is_precise {
+                    precise = Some(tpg);
+                    tty_holders.push(tpg);
+                    break;
+                }
+                tty_holders.push(tpg);
+            }
+            // (2) then its children — covers bwrap where the shell is a
+            //    descendant of the bwrap wrapper.
+            let kids = match std::fs::read_to_string(format!(
+                "/proc/{pid}/task/{pid}/children"
+            )) {
+                Ok(s) => s,
+                Err(e) => {
+                    trace_sigwinch(&format!(
+                        "  depth={depth} pid={pid} children_read_fail err={e}"
+                    ));
+                    String::new()
+                }
+            };
+            trace_sigwinch(&format!(
+                "  depth={depth} pid={pid} children={:?}",
+                kids.split_whitespace().collect::<Vec<_>>()
+            ));
+            for k in kids.split_whitespace() {
+                let k: i32 = match k.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if k == our_pid {
+                    continue;
+                }
+                next.push(k);
+                if let Some((tpg, is_precise)) = inspect(k, "child", depth) {
+                    if is_precise {
+                        precise = Some(tpg);
+                        tty_holders.push(tpg);
+                        break;
+                    }
+                    tty_holders.push(tpg);
+                }
+            }
+            if precise.is_some() {
+                break;
+            }
+        }
+        if precise.is_some() {
+            break;
+        }
+        frontier = next;
+    }
+    tty_holders.dedup();
+    if let Some(p) = precise {
+        trace_sigwinch(&format!(
+            "child_host_namespace_pgrps: precise host_pgrp={p}; tty_holders_all={tty_holders:?}"
+        ));
+        vec![p]
+    } else {
+        trace_sigwinch(&format!(
+            "child_host_namespace_pgrps: no precise match (dev={dev:#x}); signaling all tty_holders={tty_holders:?}"
+        ));
+        tty_holders
     }
 }
 
 /// Explicitly send SIGWINCH to the PTY foreground process group.
-/// TIOCSWINSZ should do this via the kernel, but bwrap's PID
-/// namespace can prevent delivery. This is the reliable fallback.
+/// `TIOCSWINSZ` (in `resize_pty`) should do this via the kernel, but
+/// bwrap's PID namespace can prevent delivery. This is the reliable
+/// fallback; under a plain (no bwrap) run the `kill(-pgrp)` succeeds and
+/// we never reach the fallback.
 fn forward_sigwinch() {
     let master = MASTER_FD.load(Ordering::SeqCst);
     if master < 0 {
         return;
     }
     let mut pgrp: nix::libc::pid_t = 0;
-    let ret =
-        unsafe { nix::libc::ioctl(master, nix::libc::TIOCGPGRP, &mut pgrp) };
-    if ret == 0 && pgrp > 0 {
-        unsafe {
-            nix::libc::kill(-pgrp, nix::libc::SIGWINCH);
+    let tc = unsafe { nix::libc::ioctl(master, nix::libc::TIOCGPGRP, &mut pgrp) };
+    if tc == 0 && pgrp > 0 {
+        let r = unsafe { nix::libc::kill(-pgrp, nix::libc::SIGWINCH) };
+        if r == 0 {
+            trace_sigwinch(&format!(
+                "forward_sigwinch: tcgetpgrp_ok pgrp={pgrp} kill_ok"
+            ));
+            return;
         }
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        trace_sigwinch(&format!(
+            "forward_sigwinch: tcgetpgrp_ok pgrp={pgrp} kill_ret={r} errno={e} (child-ns pgrp, ESRCH expected under bwrap --unshare-pid)"
+        ));
+    } else {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        trace_sigwinch(&format!(
+            "forward_sigwinch: tcgetpgrp failed (ret={tc} pgrp={pgrp} errno={e})"
+        ));
+    }
+    // bwrap --unshare-pid fallback: deliver SIGWINCH to the child's
+    // host-namespace foreground pgrp(s) (see `child_host_namespace_pgrps`).
+    for host_pgrp in child_host_namespace_pgrps() {
+        let r = unsafe { nix::libc::kill(-host_pgrp, nix::libc::SIGWINCH) };
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        trace_sigwinch(&format!(
+            "forward_sigwinch[fallback]: host_pgrp={host_pgrp} kill_ret={r} errno={e}"
+        ));
     }
 }
 
@@ -238,6 +479,11 @@ struct IoLoop<'a> {
     osc: OscForwarder,
     terminal_passthrough: bool,
     primary_filter: TerminalFilter,
+    /// Filtered-passthrough alt screen (`TerminalFilter::raw_alt`): keeps
+    /// all CSI (the host answers DA/kitty/6 n) but drops OSC/DCS strings.
+    /// Used on the default (no `--terminal-passthrough`) raw alt path so
+    /// fullscreen TUIs render natively without leaking clipboard OSC 52.
+    alt_filter: TerminalFilter,
     status_bar: bool,
     /// `CSI 6 n` split across reads of the child PTY.
     cursor_requests: CursorRequestParser,
@@ -252,6 +498,14 @@ impl<'a> IoLoop<'a> {
         terminal_passthrough: bool,
         status_bar: bool,
     ) -> Self {
+        // Eagerly touch the trace so a user who set `AI_JAIL_TRACE_SIGWINCH`
+        // gets an immediate `trace.log` (proving the running binary actually
+        // has tracing compiled in) instead of an empty/missing file when no
+        // resize happens to fire. No-op when the env var is unset.
+        trace_sigwinch(&format!(
+            "ai-jail: io loop started (rows={} cols={} status_bar={} passthrough={})",
+            init_rows, init_cols, status_bar, terminal_passthrough
+        ));
         let content_rows = if status_bar { init_rows - 1 } else { init_rows };
         let content_cols = init_cols;
         let parser = vt100::Parser::new(content_rows, content_cols, 0);
@@ -272,6 +526,7 @@ impl<'a> IoLoop<'a> {
             osc: OscForwarder::new(terminal_passthrough),
             terminal_passthrough,
             primary_filter: TerminalFilter::new(),
+            alt_filter: TerminalFilter::raw_alt(),
             status_bar,
             cursor_requests: CursorRequestParser::default(),
         }
@@ -316,29 +571,76 @@ impl<'a> IoLoop<'a> {
 
         let screen = self.parser.screen();
         let on_alt = screen.alternate_screen();
-        if on_alt {
-            // Alt screen: full clear + repaint from vt100 so
-            // prev_screen matches the real terminal for subsequent
-            // state_diff rendering.
+        if on_alt && self.status_bar {
+            // Only the status-bar alt screen is re-rendered by the proxy: it
+            // must clear and repaint (the bar overlays the bottom row). Any
+            // no-status-bar alt screen — whether raw via
+            // `--terminal-passthrough` or the default filtered-raw path — is
+            // owned by the child and redraws itself after SIGWINCH, so
+            // repainting from vt100 here would race it and reintroduce the
+            // cursor drift / "messed up until clear" residue seen on
+            // fullscreen TUIs like pool.
             write_all_raw(self.stdout, b"\x1b[r\x1b[H\x1b[J");
             let output = screen.state_formatted();
             write_all_raw(self.stdout, &output);
         } else {
-            // Primary screen: preserve visible content (avoid a blank
-            // flash on maximize). Reset the scroll region and clean up
-            // the old status-bar ghost row, then let the child repaint
-            // on its own after SIGWINCH.
-            write_all_raw(self.stdout, b"\x1b[r");
-            if self.status_bar && old_content_rows < self.content_rows {
-                let seq = format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
-                write_all_raw(self.stdout, seq.as_bytes());
-            }
+            // Primary screen (e.g. `bash`/`echo`): preserve visible content
+            // and let the host terminal re-flow its scrollback into any
+            // newly-grown rows the same way a normal terminal would, then let
+            // the child repaint on its own after SIGWINCH.
+            //
+            // Do NOT emit a bare `DECSTBM` reset (`ESC [ r`) on a GROW here:
+            // `DECSTBM` relocates the cursor to home and resets the scroll
+            // region, which disrupts the host's scrollback re-flow and
+            // reintroduces the "residual text" ghost. Emitting a clear of the
+            // grown rows (`ESC [ <old+1>;1H ESC [ J`) instead "fixes" the ghost
+            // by wiping those rows -- but that also erases the scrolled command
+            // output (e.g. `ls`/`seq` that exceeded the old height) that the
+            // host would otherwise re-flow, producing "the output disappears".
+            // Leaving the host untouched on grow reproduces plain `bash` exactly.
+            let grew = old_content_rows < self.content_rows;
+            trace_sigwinch(&format!(
+                "sigwinch: alt={} status_bar={} old={} new={} grew={}",
+                on_alt, self.status_bar, old_content_rows, self.content_rows, grew
+            ));
             if self.status_bar {
+                // Status bar owns the bottom row: reset the region, blank the
+                // old ghost row, and re-establish a status-bar region.
+                write_all_raw(self.stdout, b"\x1b[r");
+                if grew {
+                    let seq = format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
+                    write_all_raw(self.stdout, seq.as_bytes());
+                }
                 set_scroll_region(self.stdout, self.content_rows);
+            } else if !grew {
+                // Shimmed or shrunk (or unchanged): a bare `DECSTBM` reset is
+                // safe here -- no new rows to re-flow, so it can't disrupt the
+                // host. Keep the cursor-neutral reset used on exit.
+                reset_scroll_region(self.stdout);
             }
-            let (row, col) = screen.cursor_position();
-            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-            write_all_raw(self.stdout, seq.as_bytes());
+            if !grew {
+                // On shrink/same: nudge the host cursor to the parser's
+                // cursor so subsequent pass-through output stays in sync.
+                let (row, col) = screen.cursor_position();
+                let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+                write_all_raw(self.stdout, seq.as_bytes());
+                trace_sigwinch(&format!(
+                    "host_emit: primary CUP {} {}",
+                    row + 1,
+                    col + 1
+                ));
+            } else {
+                // On grow: do NOT reposition the host cursor. The terminal
+                // emulator re-flows its scrollback on resize, so bash's
+                // repaint lands at the new bottom -- exactly like plain bash
+                // after a `TIOCSWINSZ`+`SIGWINCH`. A CUP to the *stale*
+                // parser cursor row (the position under the OLD size) would
+                // strand the cursor mid-screen, which is the zoom cursor bug:
+                // the cursor sits where the prompt *used* to be instead of at
+                // the new bottom. Leaving the host untouched on grow
+                // reproduces plain `bash` exactly.
+                trace_sigwinch("host_emit: primary GROW (no CUP; host re-flows)");
+            }
         }
 
         self.prev_screen = screen.clone();
@@ -349,6 +651,11 @@ impl<'a> IoLoop<'a> {
         }
         resize_pty();
         forward_sigwinch();
+        // Arm the post-resize child-byte capture (env-gated) so the trace
+        // can show whether the child repainted after the resize/SIGWINCH.
+        if sigwinch_trace_enabled() {
+            RESIZE_CHILD_BUDGET.store(8192, Ordering::SeqCst);
+        }
         if !on_alt && self.resize_redraw_key.is_some() {
             // Let the child process SIGWINCH first, then nudge it to
             // repaint once the terminal goes quiet.
@@ -366,6 +673,16 @@ impl<'a> IoLoop<'a> {
     /// `ControlFlow::Break(())` when the loop should exit (child
     /// closed the PTY).
     fn handle_master_read(&mut self, buf: &[u8]) -> std::ops::ControlFlow<()> {
+        let rem = RESIZE_CHILD_BUDGET.load(Ordering::Relaxed);
+        if rem > 0 {
+            let n = buf.len().min(rem);
+            trace_sigwinch(&format!(
+                "child_read after resize: {} bytes: {:?}",
+                n,
+                &buf[..n]
+            ));
+            RESIZE_CHILD_BUDGET.fetch_sub(n, Ordering::Relaxed);
+        }
         let replies = cursor_replies(
             &mut self.parser,
             &mut self.cursor_requests,
@@ -374,15 +691,63 @@ impl<'a> IoLoop<'a> {
         );
         let screen = self.parser.screen();
         let now_alt = screen.alternate_screen();
-        // Answer from the vt100 cursor unless this chunk is delivered
-        // raw to the host, which then answers the query itself.
+        // A "raw" alt screen is one the child owns outright AND there is no
+        // status bar overlaying it: every fullscreen TUI (pool, opencode, …)
+        // on a terminal WITHOUT a status bar expects the *real* terminal to
+        // render it — whether or not `--terminal-passthrough` is set.
+        // Re-rendering such output through vt100's state_diff drifts the
+        // cursor (the line-number gutter bleeds into the content and columns
+        // walk) once the screen wraps or the child redraws after a resize —
+        // so on a raw alt screen we forward the child's bytes to the host and
+        // let foot/tmux paint them, exactly as a terminal running the TUI
+        // directly would.
+        //
+        // With `--terminal-passthrough` the child's bytes go verbatim;
+        // without it we still run them through the `alt_filter` so clipboard
+        // OSC 52 stays stripped (the sandboxed child must not read/write the
+        // host clipboard) while every CSI is kept (the host answers DA/kitty/
+        // `6 n`), and `osc.feed` re-injects the window title sanitized.
+        let raw_alt = now_alt && !self.status_bar;
+        let was_raw_alt = self.was_alt_screen && !self.status_bar;
+        // Answer from the vt100 cursor unless the host will answer
+        // itself (a raw alt screen, or the primary screen with
+        // passthrough on).
         if !host_answers_cursor_request(
             self.terminal_passthrough,
             self.was_alt_screen,
             now_alt,
+            self.status_bar,
         ) && !replies.is_empty()
         {
             write_all_raw(self.master_raw, &replies);
+        }
+
+        if raw_alt || was_raw_alt {
+            // Raw alt screen: the child owns the terminal. Forward its
+            // bytes to the host so foot/tmux renders the TUI directly —
+            // do NOT re-render via vt100 (state_diff drifts after a resize)
+            // and do NOT intercept the child's CSI capability queries
+            // (the host answers DA/kitty/`6 n`, so the TUI detects the real
+            // terminal instead of a vt100 cursor that can desync from it).
+            //
+            // With `--terminal-passthrough` the bytes go verbatim. Without
+            // it we filter through `alt_filter` first: that keeps every CSI
+            // (drawing + queries, forwarded to the host) but drops OSC/DCS
+            // *strings* — so clipboard OSC 52 never reaches the host (the
+            // sandboxed child cannot read/write it) while `osc.feed`
+            // re-injects only a sanitized window title. `cursor_replies`
+            // above still advances the parser so alternate_screen() and the
+            // resize path stay correct.
+            if self.terminal_passthrough {
+                write_all_raw(self.stdout, buf);
+            } else {
+                let filtered = self.alt_filter.feed(buf);
+                write_all_raw(self.stdout, &filtered);
+                self.osc.feed(self.stdout, buf);
+            }
+            self.was_alt_screen = now_alt;
+            self.prev_screen = screen.clone();
+            return std::ops::ControlFlow::Continue(());
         }
 
         // Forward CSI control/query sequences that vt100 silently
@@ -799,15 +1164,32 @@ fn cursor_replies(
     out
 }
 
-/// The real terminal sees child bytes raw only while we stay on the
-/// primary screen with passthrough on. That is the one case where it
-/// answers `CSI 6 n` itself.
+/// The real terminal answers `CSI 6 n` itself whenever the child's
+/// bytes reach it: on any no-status-bar alt screen (the child owns the
+/// terminal) — entering, steady, or exiting — plus the primary screen
+/// with `--terminal-passthrough`. On every other path the proxy owns the
+/// cursor and answers from vt100: the primary screen without passthrough
+/// (the primary filter strips the query), and any status-bar alt screen
+/// (re-rendered through `state_diff`).
+///
+/// Note this is *not* gated on `terminal_passthrough` for the alt clause:
+/// the default (no flag) alt path is now a filtered passthrough that
+/// forwards `CSI 6 n` to the host, so the host must answer it the same way
+/// it would under `--terminal-passthrough`. Gating it on passthrough would
+/// make the proxy synthesise a second (racing) report from a vt100 cursor
+/// the host never sees.
 fn host_answers_cursor_request(
     passthrough: bool,
     was_alt: bool,
     now_alt: bool,
+    status_bar: bool,
 ) -> bool {
-    passthrough && !was_alt && !now_alt
+    // Any no-status-bar alt screen (default filtered-raw or passthrough):
+    // the child's `CSI 6 n` reaches the host, so the host answers. This
+    // covers raw alt enter / steady / exit. The `!was_alt && !now_alt`
+    // clause covers the primary screen with passthrough (raw primary).
+    (!status_bar && (now_alt || was_alt))
+        || (passthrough && !was_alt && !now_alt)
 }
 
 /// Scan child output for CSI control/query sequences that vt100 does
@@ -899,12 +1281,31 @@ enum FilterState {
 /// so without that distinction the filter mistook them for DCS/CSI/OSC
 /// introducers and a C1 ST, swallowing rows of the banner and leaking the
 /// tail of the window-title OSC as text.
+/// How aggressively the filter strips CSI queries from the child stream.
+enum StripMode {
+    /// Primary screen: keep drawing commands (SGR/cursor) + plain text,
+    /// drop everything vt100 owns — OSC/DCS/APC/PM strings and the
+    /// capability queries the proxy itself answers (kitty-keyboard
+    /// `CSI >…u`, DA `CSI c`, XTVERSION `CSI > q`, DSR `CSI 6 n`).
+    Primary,
+    /// Raw alt screen (filtered passthrough): drop only the OSC/DCS/APC/PM
+    /// *strings* (clipboard OSC 52 stays stripped for sandbox security;
+    /// the window title is re-emitted sanitized by `OscForwarder`), but
+    /// keep **every** CSI — including capability queries — so the real
+    /// terminal (foot/tmux) answers them and the fullscreen TUI detects it.
+    /// This is the secure default alt path: the child's drawing reaches
+    /// the host verbatim (no vt100 re-render, so no resize drift) while
+    /// the clipboard never does.
+    RawAlt,
+}
+
 struct TerminalFilter {
     state: FilterState,
     pending: Vec<u8>,
     /// Continuation bytes still expected for the UTF-8 character in
     /// progress; while non-zero, `0x80..=0xbf` is character data.
     utf8_remaining: u8,
+    mode: StripMode,
 }
 
 impl TerminalFilter {
@@ -913,6 +1314,18 @@ impl TerminalFilter {
             state: FilterState::Ground,
             pending: Vec::new(),
             utf8_remaining: 0,
+            mode: StripMode::Primary,
+        }
+    }
+
+    /// Filtered-passthrough alt screen: keep all CSI (the host answers
+    /// queries), drop only OSC/DCS/APC/PM strings.
+    fn raw_alt() -> Self {
+        Self {
+            state: FilterState::Ground,
+            pending: Vec::new(),
+            utf8_remaining: 0,
+            mode: StripMode::RawAlt,
         }
     }
 
@@ -1037,12 +1450,20 @@ impl TerminalFilter {
                 FilterState::Csi => {
                     self.pending.push(b);
                     if (0x40..=0x7e).contains(&b) {
-                        let prefix = self
-                            .pending
-                            .get(2)
-                            .copied()
-                            .filter(|p| matches!(p, b'>' | b'<' | b'?'));
-                        if !csi_final_forwardable(b, prefix) && b != b'n' {
+                        // RawAlt forwards every CSI verbatim — SGR, cursor
+                        // moves, DA, kitty-keyboard protocol, DSR `6 n` —
+                        // so the real terminal renders the child's drawing
+                        // and answers the queries a vt100 re-render cannot
+                        // (a vt100 cursor desyncs from the host after a
+                        // resize). Primary still drops the queries it owns.
+                        if matches!(self.mode, StripMode::RawAlt)
+                            || (!csi_final_forwardable(b, {
+                                self.pending
+                                    .get(2)
+                                    .copied()
+                                    .filter(|p| matches!(p, b'>' | b'<' | b'?'))
+                            }) && b != b'n')
+                        {
                             out.extend_from_slice(&self.pending);
                         }
                         self.pending.clear();
@@ -1432,6 +1853,10 @@ fn run_with_passthrough(
 
     // Configure child to use PTY slave as stdin/stdout/stderr
     let slave_raw = slave.as_raw_fd();
+    // Record the slave PTY device so the SIGWINCH /proc fallback (which
+    // matches descendants' `tty_nr` against the device the child actually
+    // holds) compares against the slave, not the master (`/dev/ptmx`).
+    set_slave_dev(slave_raw);
     unsafe {
         cmd.pre_exec(move || {
             if nix::libc::setsid() == -1 {
@@ -2219,12 +2644,36 @@ mod tests {
     }
 
     #[test]
-    fn host_answers_cursor_only_on_primary_passthrough() {
-        assert!(super::host_answers_cursor_request(true, false, false));
-        assert!(!super::host_answers_cursor_request(false, false, false));
-        assert!(!super::host_answers_cursor_request(true, true, true));
-        assert!(!super::host_answers_cursor_request(true, false, true));
-        assert!(!super::host_answers_cursor_request(true, true, false));
+    fn host_answers_cursor_request_semantics() {
+        // The real terminal answers `CSI 6 n` whenever the child's bytes
+        // reach it: on ANY no-status-bar alt screen (the default
+        // filtered-raw path forwards the query through `alt_filter`, and
+        // `--terminal-passthrough` forwards it verbatim) — entering,
+        // steady, or exiting — plus the primary screen with passthrough.
+        // The proxy answers from its vt100 cursor everywhere else:
+        // primary without passthrough (the primary filter strips the
+        // query) and any status-bar alt screen (re-rendered through
+        // state_diff). Gating the alt clause on passthrough would make
+        // the proxy synthesise a second (racing) report on the default
+        // path, since the host never sees the query it is answering.
+        let bar = false;
+        // Primary + passthrough: raw -> host answers.
+        assert!(super::host_answers_cursor_request(true, false, false, bar));
+        // Primary, no passthrough: proxy answers (primary_filter strips 6 n).
+        assert!(!super::host_answers_cursor_request(false, false, false, bar));
+        // Default raw alt (no passthrough, no status bar): the alt filter
+        // keeps `CSI 6 n` and forwards it to the host, so the host answers.
+        assert!(super::host_answers_cursor_request(false, false, true, bar)); // entry
+        assert!(super::host_answers_cursor_request(false, true, true, bar)); // steady
+        assert!(super::host_answers_cursor_request(false, true, false, bar)); // exit
+        // Passthrough raw alt: host answers.
+        assert!(super::host_answers_cursor_request(true, false, true, bar));
+        assert!(super::host_answers_cursor_request(true, true, true, bar));
+        assert!(super::host_answers_cursor_request(true, true, false, bar));
+        // Status-bar alt (re-rendered): proxy answers, any passthrough.
+        assert!(!super::host_answers_cursor_request(true, false, true, true));
+        assert!(!super::host_answers_cursor_request(true, true, true, true));
+        assert!(!super::host_answers_cursor_request(true, true, false, true));
     }
 
     #[test]
@@ -2320,5 +2769,439 @@ mod tests {
         // after set_scroll_region — complete CSI, ends at ground.
         assert!(ends_at_ground_state(b"\x1b[12;1H"));
         assert!(ends_at_ground_state(b"\x1b[1;80H"));
+    }
+
+    /// Assert the host-repaint bytes `handle_sigwinch` emits for a
+    /// primary-screen (status_bar off — the tmux default) resize GROW.
+    ///
+    /// On a grow the proxy must **not** touch the grown rows: no `DECSTBM`
+    /// reset (`ESC [ r`) and no erase (`ESC [ <old+1>;1H ESC [ J`). A bare
+    /// `ESC [ r` relocates the cursor home and resets the scroll region,
+    /// which disrupts the host terminal's scrollback re-flow and reintroduces
+    /// the "residual text after tmux fullscreen" ghost. Clearing the grown
+    /// rows instead "fixes" the ghost by wiping those rows — but that also
+    /// erases the scrolled command output (`ls`/`seq` that exceeded the old
+    /// height) that a normal terminal re-flows into them, producing
+    /// "the output disappears". Leaving the host untouched on grow reproduces
+    /// plain `bash` exactly (verified: `seq 1 30` + zoom re-flows 9..30 into
+    /// rows 1-22, prompt at row 24).
+    ///
+    /// Deterministic in `cargo test`: the harness captures fd 1 (a pipe), so
+    /// `real_term_size()` is `None` and the fallback `init_rows` is used,
+    /// giving a 12 -> 24 grow regardless of the real terminal size.
+    #[test]
+    fn handle_sigwinch_does_not_blank_grown_rows_on_primary_grow() {
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        // init_rows=24 is the fallback host size; seed content_rows=12 so the
+        // resize is a grow.
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            false,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        io.content_rows = 12;
+        io.content_cols = 80;
+        io.parser.screen_mut().set_size(12, 80);
+        io.parser.process(b"\x1b[5;3H"); // cursor -> row 5, col 3
+
+        super::set_sigwinch_pending();
+        io.handle_sigwinch();
+
+        drop(out_w);
+        drop(master_w);
+        let mut buf = vec![0u8; 1024];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut buf).unwrap_or(0);
+        let got = String::from_utf8_lossy(&buf[..n]);
+
+        // No erasing of the grown rows (would wipe scrolled command output).
+        assert!(
+            !got.contains("\x1b[J") && !got.contains("\x1b[2K"),
+            "must not clear rows/lines on primary grow; got {got:?}"
+        );
+        // On a primary GROW we emit NOTHING to the host. The terminal
+        // emulator re-flows its scrollback on resize, so bash's repaint after
+        // SIGWINCH lands at the new bottom -- exactly like plain `bash`. A CUP
+        // to the *stale* parser cursor row (the cursor position under the OLD
+        // size) would strand the cursor mid-screen, which is the zoom cursor
+        // bug; leaving the host untouched on grow reproduces plain bash.
+        // (On a shrink the only host write is the cursor restore; see the
+        // shrink test.)
+        assert!(
+            got.is_empty(),
+            "expected no host write on primary grow, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn handle_sigwinch_emits_cup_and_scroll_reset_on_shrink() {
+        // Counterpart to the grow test: a no-status-bar SHRINK must still
+        // reset the scroll region (safe -- no re-flow to disrupt) and re-sync
+        // the host cursor to the parser cursor so bash's repaint lands in the
+        // right place. The grow fix must not have touched this path.
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        // init_rows=24 host -> content_rows=12 (the fallback host size used
+        // when stdout is not a tty); seed a grow so the first handle_sigwinch
+        // is a shrink (12 -> ... no, force: set content_rows=24, host=12).
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            12, // host rows (smaller than content_rows -> shrink)
+            80,
+            None,
+            false,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        io.content_rows = 24; // larger than host (12) -> this resize is a shrink
+        io.content_cols = 80;
+        io.parser.screen_mut().set_size(24, 80);
+        io.parser.process(b"\x1b[5;3H"); // cursor -> row 5, col 3
+
+        super::set_sigwinch_pending();
+        io.handle_sigwinch();
+
+        drop(out_w);
+        drop(master_w);
+        let mut buf = vec![0u8; 1024];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut buf).unwrap_or(0);
+        let got = String::from_utf8_lossy(&buf[..n]);
+
+        // Shrink still resets the scroll region (cursor-neutral DECSTBM) and
+        // re-syncs the host cursor to the parser position so bash's repaint
+        // lands in the right place. The grow fix must not have touched this.
+        assert!(
+            got.contains("\x1b[r"),
+            "shrink must reset the scroll region; got {got:?}"
+        );
+        // set_size may preserve (5;3) or home (1;1) the cursor; accept either.
+        assert!(
+            got.contains("\x1b[5;3H") || got.contains("\x1b[1;1H") || got.contains("\r"),
+            "shrink must re-sync the host cursor; got {got:?}"
+        );
+        // No grown-row erase on shrink either.
+        assert!(
+            !got.contains("\x1b[J") && !got.contains("\x1b[2K"),
+            "must not clear rows/lines on shrink; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn handle_sigwinch_skips_host_repaint_on_raw_alt_screen() {
+        // `--terminal-passthrough` alt screen (no status bar): the child
+        // owns the terminal and redraws itself after SIGWINCH. handle_sigwinch
+        // must NOT repaint the host from vt100 (ESC[r ESC[H ESC[J +
+        // state_formatted) — that re-render races the child's own redraw and
+        // is the source of pool's post-resize column drift ("messed up until
+        // clear"). Asserts the host fd stays empty on a grow.
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        // terminal_passthrough=true, status_bar=false -> raw alt path.
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            true,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        // Place the parser in the alt screen without driving the full
+        // handle_master_read (which would itself write the enter sequence).
+        io.parser.process(b"\x1b[?1049h");
+        io.was_alt_screen = true;
+        // Seed a stale size so handle_sigwinch is a grow (12 -> 24 via the
+        // init_rows fallback used when stdout is a pipe, not a tty).
+        io.content_rows = 12;
+        io.content_cols = 80;
+        io.parser.screen_mut().set_size(12, 80);
+
+        super::set_sigwinch_pending();
+        io.handle_sigwinch();
+
+        drop(out_w);
+        let mut buf = vec![0u8; 1024];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut buf).unwrap_or(0);
+        assert!(
+            n == 0,
+            "raw alt resize must not repaint the host; got {buf:?}"
+        );
+    }
+
+    #[test]
+    fn raw_alt_screen_forwards_child_bytes_verbatim() {
+        // A fullscreen TUI (alt screen) on a terminal WITHOUT a status bar
+        // owns its terminal: ai-jail must forward its bytes verbatim to the
+        // host (so foot/tmux renders the TUI natively) instead of
+        // re-rendering through vt100's state_diff — which drifts the cursor
+        // after a resize (line-number gutter bleeds into content, columns
+        // walk). Exercises `handle_master_read` directly via the no-bwrap
+        // `run_with_config` io_loop construction (pipe-backed fds).
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        // status_bar = false, terminal_passthrough = true (--terminal-passthrough).
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            true,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+
+        // Alt-screen enter + a CSI capability query + an OSC title + body,
+        // exactly the kind of launch stream pool/opencode emit.
+        let buf = b"\x1b[?1049h\x1b[>4;2mHello, TUI\x1b]2;pool\x07world";
+        let _ = io.handle_master_read(buf);
+
+        // Alternate screen state must be remembered across reads so the
+        // resize path and the exit transition stay consistent.
+        assert!(io.was_alt_screen, "alternate screen should be detected");
+
+        drop(out_w);
+        let mut got = vec![0u8; 2048];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut got).unwrap_or(0);
+        got.truncate(n);
+
+        // Raw: child bytes forwarded byte-for-byte — no state_formatted
+        // repaint, no ESC[H/ESC[J host-clear prefix, no cursor-restore.
+        assert_eq!(
+            got,
+            buf,
+            "raw alt screen must forward child bytes verbatim, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn bar_alt_screen_still_re_renders_via_state_diff() {
+        // Regression guard: with a status bar the alt screen is re-rendered
+        // (the bar overlays the bottom row), it is NOT raw-forwarded.
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            false,
+            true, // status_bar ON
+        );
+        io.stdout = out_w.as_raw_fd();
+
+        let buf = b"\x1b[?1049hX";
+        let _ = io.handle_master_read(buf);
+
+        drop(out_w);
+        let mut got = vec![0u8; 4096];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut got).unwrap_or(0);
+        got.truncate(n);
+
+        // Not verbatim: the transition repaint (ESC[r ESC[H ESC[J + state_formatted)
+        // is emitted, so the raw child bytes are re-rendered, not echoed.
+        assert_ne!(
+            got,
+            buf,
+            "status-bar alt screen must not be raw-forwarded"
+        );
+        assert!(
+            got.starts_with(b"\x1b[r\x1b[H\x1b[J"),
+            "status-bar alt entry must repaint the host screen, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn handle_sigwinch_skips_host_repaint_on_default_raw_alt_screen() {
+        // Default (no --terminal-passthrough) filtered-raw alt (no status
+        // bar): the child still owns the terminal and redraws itself after
+        // SIGWINCH, so handle_sigwinch must NOT repaint the host from vt100
+        // — exactly like the passthrough raw alt. The host fd stays empty
+        // on a grow.
+        let (_master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        // terminal_passthrough=false, status_bar=false -> default raw alt.
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            false,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        // Place the parser in the alt screen without driving the full
+        // handle_master_read (which would itself write the enter sequence).
+        io.parser.process(b"\x1b[?1049h");
+        io.was_alt_screen = true;
+        // Seed a stale size so handle_sigwinch is a grow (12 -> 24 via the
+        // init_rows fallback used when stdout is a pipe, not a tty).
+        io.content_rows = 12;
+        io.content_cols = 80;
+        io.parser.screen_mut().set_size(12, 80);
+
+        super::set_sigwinch_pending();
+        io.handle_sigwinch();
+
+        drop(out_w);
+        let mut buf = vec![0u8; 1024];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut buf).unwrap_or(0);
+        assert!(
+            n == 0,
+            "default raw alt resize must not repaint the host; got {buf:?}"
+        );
+    }
+
+    #[test]
+    fn default_raw_alt_screen_forwards_csi_queries_strips_clipboard() {
+        // Default (no --terminal-passthrough) filtered-raw alt: the child's
+        // CSI capability queries (DA, DSR 6 n, kitty keyboard) reach the host
+        // so the TUI detects the real terminal, while clipboard OSC 52 is
+        // still stripped — the host answers the queries (no proxy synthesis).
+        let out = rendered_output(
+            false,
+            b"\x1b[?1049h\x1b[c\x1b[6n\x1b[>1u\x1b]52;c;ZGF0YQ==\x07",
+        );
+        let text = String::from_utf8_lossy(&out);
+        // CSI queries forwarded verbatim to the host.
+        assert!(text.contains("\x1b[c"), "{text:?}");
+        assert!(text.contains("\x1b[6n"), "{text:?}");
+        assert!(text.contains("\x1b[>1u"), "{text:?}");
+        // Clipboard 52 stays stripped.
+        assert!(!text.contains("]52;"), "{text:?}");
+    }
+
+    #[test]
+    fn default_raw_alt_screen_forwards_drawing_no_state_diff() {
+        // Default raw alt forwards the child's actual drawing bytes (no
+        // vt100 state_diff repaint) — that is what eliminates the resize
+        // drift: the host renders exactly what the child emits.
+        let out = rendered_output(false, b"\x1b[?1049h\x1b[2J\x1b[Hrow1");
+        assert_eq!(
+            out,
+            b"\x1b[?1049h\x1b[2J\x1b[Hrow1",
+            "default raw alt must forward drawing verbatim, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn raw_alt_filter_keeps_csi_strips_osc_and_dcs() {
+        let mut f = super::TerminalFilter::raw_alt();
+        // CSI drawing + capability queries (DA, DSR 6 n, kitty keyboard)
+        // are kept verbatim so the real terminal renders and answers them.
+        assert_eq!(
+            f.feed(b"\x1b[31m\x1b[6n\x1b[c\x1b[>1u"),
+            b"\x1b[31m\x1b[6n\x1b[c\x1b[>1u"
+        );
+        // OSC (title + clipboard 52) and DCS are dropped — clipboard 52
+        // must never reach the host on the default path.
+        assert_eq!(
+            f.feed(b"\x1b]2;t\x07\x1b]52;c;data\x07\x1bPdata\x1b\\text"),
+            b"text"
+        );
+        // UTF-8 drawing bytes are not mistaken for C1 introducers.
+        let mut g = super::TerminalFilter::raw_alt();
+        assert_eq!(
+            g.feed(&[0xe2, 0x96, 0x90, b'A']),
+            &[0xe2, 0x96, 0x90, b'A']
+        );
+        // OSC 52 split across reads is still dropped.
+        let mut h = super::TerminalFilter::raw_alt();
+        assert_eq!(h.feed(b"\x1b]52;c;"), b"");
+        assert_eq!(h.feed(b"part\x07after"), b"after");
+    }
+
+    #[test]
+    fn primary_filter_primary_mode_is_unchanged_and_still_strips_queries() {
+        // Regression guard: new StripMode must not alter the existing
+        // primary-screen filter (drops DA/kitty/6 n/DCS/OSC; keeps drawing).
+        let mut f = super::TerminalFilter::new();
+        assert_eq!(
+            f.feed(b"\x1b[31m\x1b]52;c;data\x07\x1b[c\x1b[6n"),
+            b"\x1b[31m"
+        );
+    }
+
+    #[test]
+    fn child_host_namespace_pgrps_resolves_descendant_tty_holder() {
+        // Non-bwrap stand-in for the bwrap case: the recorded child pid is a
+        // wrapper (`sh`) and the real tty holder (`sleep`, forked by sh) is its
+        // descendant -- exactly mirroring bwrap where ai-jail's direct child
+        // is bwrap and the shell is bwrap's descendant. Exercises the same
+        // /proc traversal + tty_nr/tpgid parsing the bwrap path relies on,
+        // without needing bwrap (which is blocked in this sandbox).
+        use std::os::unix::process::CommandExt;
+
+        let pty = match super::open() {
+            Ok(p) => p,
+            Err(_) => return, // PTY unavailable in this environment -> skip
+        };
+        let master_fd = pty.0.master.as_raw_fd();
+        let slave_raw = pty.0.slave.as_raw_fd();
+        let stdin_slave = match pty.0.slave.try_clone() {
+            Ok(fd) => fd,
+            Err(_) => return,
+        };
+        let stdout_slave = match pty.0.slave.try_clone() {
+            Ok(fd) => fd,
+            Err(_) => return,
+        };
+        let stderr_slave = match pty.0.slave.try_clone() {
+            Ok(fd) => fd,
+            Err(_) => return,
+        };
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 3"]);
+        cmd.stdin(std::process::Stdio::from(stdin_slave));
+        cmd.stdout(std::process::Stdio::from(stdout_slave));
+        cmd.stderr(std::process::Stdio::from(stderr_slave));
+        unsafe {
+            cmd.pre_exec(move || {
+                // Mirror pty::run_with_passthrough: become a session leader
+                // with the slave as controlling terminal so the forked
+                // `sleep` inherits it (so sleep's tty_nr == slave device).
+                let _ = nix::libc::setsid();
+                let _ =
+                    nix::libc::ioctl(slave_raw, nix::libc::TIOCSCTTY as _, 0);
+                Ok(())
+            })
+        };
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let pid = child.id() as i32;
+
+        super::MASTER_FD.store(
+            master_fd,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        // Record the slave device so the resolver can do a *precise*
+        // tty_nr == slave_dev match (not just the loose fallback).
+        super::set_slave_dev(pty.0.slave.as_raw_fd());
+        crate::signals::set_child_pid(pid);
+        // Give `sh` time to fork `sleep` and take the controlling tty.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let pgrps = super::child_host_namespace_pgrps();
+        // The descendant `sleep` holds the ctty, so the resolver MUST return a
+        // non-empty set of killable host-namespace pgids. If this fails, the
+        // bwrap fallback won't deliver SIGWINCH either.
+        assert!(
+            !pgrps.is_empty(),
+            "expected the resolver to find a tty-holding descendant of {pid} \
+             (master_dev logged in trace)"
+        );
+
+        let _ = unsafe { nix::libc::kill(pid, nix::libc::SIGTERM) };
+        let _ = child.wait();
+        super::MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+        super::SLAVE_DEV.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::signals::set_child_pid(0);
     }
 }

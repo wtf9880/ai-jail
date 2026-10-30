@@ -8,6 +8,15 @@ pub fn set_child_pid(pid: i32) {
     CHILD_PID.store(pid, Ordering::SeqCst);
 }
 
+/// bwrap's host-namespace pid (the process `aio-jail` spawned directly).
+/// Needed because under `bwrap --unshare-pid` the child runs in a child PID
+/// namespace: the foreground-PGID reported by the PTY master is a
+/// child-namespace id that the parent cannot `kill(2)` (ESRCH), but the
+/// child still has a host-namespace pid we *can* reach via `/proc`.
+pub fn child_pid() -> i32 {
+    CHILD_PID.load(Ordering::SeqCst)
+}
+
 extern "C" fn forward_signal(sig: nix::libc::c_int) {
     if sig == nix::libc::SIGWINCH {
         // PTY proxy: defer to IO loop which resizes vt100 first.
